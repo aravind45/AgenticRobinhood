@@ -1,0 +1,17 @@
+# Runtime state — never commit
+position.json
+regime_state.json
+alpha_trades.db
+alpha_daemon.log
+
+# Debug / scratch
+debug_flow.py
+Untitled-1.txt
+project_alpha_signal_conditions.html
+__pycache__/
+*.pyc
+*.pyo
+
+# Secrets
+.env
+credentials.json
