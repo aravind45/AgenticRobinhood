@@ -15,8 +15,8 @@ def get_signal(symbol: str = "SPY") -> dict:
     """
     f = get_live_features(symbol)
 
-    # ── Regime filter (Markov HMM) ────────────────────────────────────────
-    regime = update_regime(f)
+    # ── Regime filter (Markov HMM) — per-symbol state ────────────────────
+    regime = update_regime(f, symbol)
     tradeable, regime_reason = is_tradeable(regime)
 
     # ── Channel converging ────────────────────────────────────────────────
@@ -46,9 +46,9 @@ def get_signal(symbol: str = "SPY") -> dict:
     log_odds = math.log(0.55 / 0.45)
 
     is_buy = signal_dir == "BUY"
-    rsi2     = f.get("vivek_rsi2") or 50.0
-    vol_ratio = f.get("vol_ratio") or 1.0
-    volume_z  = f.get("volume_zscore") or 0.0
+    rsi2      = f.get("vivek_rsi2")    or 50.0
+    vol_ratio = f.get("vol_ratio")     or 1.0   # hourly vol / daily vol — now correctly scaled
+    volume_z  = f.get("volume_zscore") or 0.0   # vs 78-bar (1-day) baseline — now correctly scaled
 
     # ── Fisher Transform — primary exhaustion detector ────────────────────
     # Replaces stepped RSI thresholds with a continuous, symbol-agnostic weight.
@@ -121,7 +121,7 @@ def get_signal(symbol: str = "SPY") -> dict:
 
     return {
         "symbol":              symbol,
-        "timeframe":           "1D",
+        "timeframe":           "5min",
         "signal":              signal_dir,
         "signal_time":         datetime.now(timezone.utc).isoformat(),
         "price":               f["last_price"],
@@ -156,10 +156,13 @@ def get_signal(symbol: str = "SPY") -> dict:
         "kf_level":            f.get("kf_level"),
         "kf_velocity":         f.get("kf_velocity"),
 
-        # Market features
+        # Market features (5-min bar scale — windows in bars, not calendar days)
         "channel_converging":  channel_converging,
-        "vol_ratio":           f.get("vol_ratio"),
-        "volume_zscore":       f.get("volume_zscore"),
+        "vol_ratio":           f.get("vol_ratio"),        # hourly vol / daily vol
+        "vol_short":           f.get("vol_short"),        # 12-bar (1h) rolling std
+        "vol_long":            f.get("vol_long"),         # 78-bar (1d) rolling std
+        "volume_zscore":       f.get("volume_zscore"),    # vs 78-bar (1d) baseline
+        "return_1bar":         f.get("return_1bar"),      # last 5 min return
         "spread_pct":          f.get("spread_pct"),
         "buying_power":        f.get("buying_power"),
         "open_position":       f.get("open_position"),

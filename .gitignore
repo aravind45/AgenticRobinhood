@@ -1,6 +1,6 @@
 # Runtime state — never commit
 position.json
-regime_state.json
+regime_*.json
 alpha_trades.db
 alpha_daemon.log
 

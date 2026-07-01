@@ -144,14 +144,17 @@ def get_live_features(symbol: str = "SPY") -> dict:
     """
     token = get_robinhood_token()
 
-    # ── 1. Historical bars (450 calendar days — enough for SMA(200)) ────────
+    # ── 1. Historical bars (30 calendar days of 5-min bars ≈ 2,300+ bars) ────
+    # 5-min bars: ~78 bars/trading day. 30 days gives ~1,650 bars (trading days only).
+    # Vivek SMA(200) and QTrend TREND_PERIOD(200) need 200+ bars — comfortably met.
+    # Indicator periods map to intraday context: EMA(10)=50min, SMA(200)=1000min≈2.5days.
     end = datetime.now(timezone.utc)
-    start = end - timedelta(days=450)
+    start = end - timedelta(days=30)
     hist = _call(token, "get_equity_historicals", {
         "symbols": [symbol],
         "start_time": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "end_time":   end.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "interval":   "day",
+        "interval":   "5minute",
         "bounds":     "regular",
     })
 
@@ -178,41 +181,49 @@ def get_live_features(symbol: str = "SPY") -> dict:
     highs   = [b["high"]   for b in ohlcv]
     lows    = [b["low"]    for b in ohlcv]
 
-    # ── 2. Stationary features ─────────────────────────────────────────────
+    # ── 2. Stationary features (5-min bar scale) ──────────────────────────
+    # On 5-min bars: 1 bar = 5 min, 12 bars = 1 hour, 78 bars ≈ 1 trading day.
+    # All windows are defined in BARS, not calendar days, to avoid mislabeling.
+    BARS_PER_HOUR = 12    # 60min / 5min
+    BARS_PER_DAY  = 78    # 6.5h trading day × 12 bars/hour
+
     def ret(n): return (closes[-1] - closes[-1 - n]) / closes[-1 - n]
 
-    returns_daily = [
+    bar_returns = [
         (closes[i] - closes[i - 1]) / closes[i - 1]
         for i in range(1, len(closes))
     ]
 
-    stds5  = _rolling_std(returns_daily, 5)
-    stds20 = _rolling_std(returns_daily, 20)
+    # Short vol  = rolling std over 1 hour (12 bars)
+    # Long vol   = rolling std over 1 trading day (78 bars)
+    stds_short = _rolling_std(bar_returns, BARS_PER_HOUR)
+    stds_long  = _rolling_std(bar_returns, BARS_PER_DAY)
 
-    vol_5  = stds5[-1]
-    vol_20 = stds20[-1]
+    vol_short = stds_short[-1]   # intraday (hourly) volatility
+    vol_long  = stds_long[-1]    # daily baseline volatility
 
-    # Volume z-score (20-day)
-    vol_window = volumes[-20:]
+    # Volume z-score: compare current bar's volume against 1 trading day baseline (78 bars)
+    # (previously used 20 bars = 100 min, which was arbitrary and not day-normalised)
+    vol_window = volumes[-BARS_PER_DAY:] if len(volumes) >= BARS_PER_DAY else volumes
     vol_mean = sum(vol_window) / len(vol_window)
     vol_std  = math.sqrt(sum((v - vol_mean) ** 2 for v in vol_window) / len(vol_window))
     vol_zscore = (volumes[-1] - vol_mean) / vol_std if vol_std else 0
 
-    # Normalised range
+    # Normalised range: compare current bar's range against 1-hour average (12 bars)
     recent_ranges = [
-        (highs[i] - lows[i]) / closes[i] for i in range(-20, 0)
+        (highs[i] - lows[i]) / closes[i] for i in range(-BARS_PER_HOUR, 0)
     ]
-    avg_range = sum(recent_ranges) / len(recent_ranges)
-    today_range = (highs[-1] - lows[-1]) / closes[-1]
-    range_norm = today_range / avg_range if avg_range else 1
+    avg_range  = sum(recent_ranges) / len(recent_ranges)
+    cur_range  = (highs[-1] - lows[-1]) / closes[-1]
+    range_norm = cur_range / avg_range if avg_range else 1
 
-    # SMA ratio
-    sma5  = sum(closes[-5:])  / 5
-    sma20 = sum(closes[-20:]) / 20
+    # Price ratio: short-term EMA vs medium-term EMA (in bars, not days)
+    sma_short = sum(closes[-BARS_PER_HOUR:]) / BARS_PER_HOUR        # 1-hour MA
+    sma_long  = sum(closes[-BARS_PER_DAY:])  / BARS_PER_DAY if len(closes) >= BARS_PER_DAY else sum(closes) / len(closes)  # 1-day MA
 
     # ── 2b. Fisher Transform + Kalman Filter ─────────────────────────────
     fisher_value, fisher_signal = _fisher_transform(closes, period=20)
-    kf_level, kf_velocity = _kalman_filter(closes, returns_daily)
+    kf_level, kf_velocity = _kalman_filter(closes, bar_returns)
 
     # ── 3. Live quote ──────────────────────────────────────────────────────
     quote_resp = _call(token, "get_equity_quotes", {"symbols": [symbol]})
@@ -285,24 +296,26 @@ def get_live_features(symbol: str = "SPY") -> dict:
         "ask":              round(ask, 4),
         "spread_pct":       round(spread_pct, 4),
 
-        # Returns
-        "return_1d":        round(ret(1),  6),
-        "return_5d":        round(ret(5),  6),
-        "return_20d":       round(ret(20), 6),
+        # Returns — labeled in BARS not days (1 bar = 5 minutes on current interval)
+        "return_1bar":      round(ret(1),  6),   # last 5 min
+        "return_12bar":     round(ret(12), 6),   # last 1 hour
+        "return_78bar":     round(ret(78) if len(closes) > 78 else ret(len(closes)//2), 6),  # last ~1 day
 
-        # Volatility
-        "vol_5d":           round(vol_5,  6) if vol_5  else None,
-        "vol_20d":          round(vol_20, 6) if vol_20 else None,
-        "vol_ratio":        round(vol_5 / vol_20, 4) if vol_5 and vol_20 else None,
-        "momentum_norm":    round(ret(1) / vol_20, 4) if vol_20 else None,
+        # Volatility — windows in bars, clearly labeled
+        "vol_short":        round(vol_short, 6) if vol_short else None,  # 1-hour rolling std
+        "vol_long":         round(vol_long,  6) if vol_long  else None,  # 1-day rolling std
+        # vol_ratio > 1 = current hour more volatile than daily baseline (momentum/chaos)
+        "vol_ratio":        round(vol_short / vol_long, 4) if vol_short and vol_long else None,
+        # momentum_norm = recent bar return normalised by daily vol (signed z-score)
+        "momentum_norm":    round(ret(1) / vol_long, 4) if vol_long else None,
 
-        # Volume
+        # Volume — z-score vs 1-day (78-bar) baseline
         "volume_today":     int(volumes[-1]),
         "volume_zscore":    round(vol_zscore, 4),
 
         # Structure
         "range_norm":       round(range_norm, 4),
-        "sma5_vs_sma20":    round((sma5 / sma20 - 1) * 100, 4),  # % above/below
+        "sma_short_vs_long": round((sma_short / sma_long - 1) * 100, 4),  # 1h MA vs 1d MA %
 
         # Fisher Transform (Ehlers)
         "fisher_value":     fisher_value,  # current: neg=oversold, pos=overbought; ±1.5+ = extreme

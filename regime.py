@@ -12,7 +12,12 @@ import json
 import math
 import os
 
-REGIME_FILE = os.path.join(os.path.dirname(__file__), "regime_state.json")
+_REGIME_DIR = os.path.dirname(__file__)
+
+
+def _regime_file(symbol: str) -> str:
+    """Per-symbol state file — prevents one symbol's features contaminating another's prior."""
+    return os.path.join(_REGIME_DIR, f"regime_{symbol}.json")
 
 STATES = ["MEAN_REVERTING", "TRENDING", "VOLATILE"]
 
@@ -69,14 +74,19 @@ def _emission(features: dict) -> dict:
     return {s: scores[s] / total for s in STATES}
 
 
-def update_regime(features: dict) -> dict:
+def update_regime(features: dict, symbol: str = "SHARED") -> dict:
     """
-    Run one step of the HMM filter.
+    Run one step of the HMM filter for the given symbol.
+    Each symbol maintains its own prior in regime_{symbol}.json so that
+    scanning AMD then NVDA does not contaminate NVDA's regime belief.
+
     Returns {"state": str, "belief": {state: probability}, "confidence": float}
     """
+    regime_file = _regime_file(symbol)
+
     # Load prior belief
-    if os.path.exists(REGIME_FILE):
-        with open(REGIME_FILE) as f:
+    if os.path.exists(regime_file):
+        with open(regime_file) as f:
             prior = json.load(f)
         # Validate keys
         if not all(s in prior for s in STATES):
@@ -95,8 +105,8 @@ def update_regime(features: dict) -> dict:
     total = sum(updated.values())
     belief = {s: round(updated[s] / total, 4) for s in STATES}
 
-    # Save posterior for next call
-    with open(REGIME_FILE, "w") as f:
+    # Save posterior for next call (per-symbol file)
+    with open(regime_file, "w") as f:
         json.dump(belief, f, indent=2)
 
     state = max(belief, key=belief.get)

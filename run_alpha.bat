@@ -5,6 +5,9 @@
 
 cd /d "%~dp0"
 
+:: Force UTF-8 output so Claude's emoji responses don't crash the log
+set PYTHONIOENCODING=utf-8
+
 :: Uncomment and fill in the line below if ANTHROPIC_API_KEY is not set globally:
 :: set ANTHROPIC_API_KEY=sk-ant-YOUR_KEY_HERE
 

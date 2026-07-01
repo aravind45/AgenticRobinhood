@@ -144,7 +144,9 @@ def compute(bars: list[dict]) -> QTrendState:
             elif cd:
                 m[i] = m_i - eps
         else:
-            m[i] = m[i - 1]
+            # Guard: m[i-1] may be None near warmup boundary (bar ~200)
+            # where the signal loop sets it to None before h_arr/l_arr are valid.
+            m[i] = m[i - 1] if m[i - 1] is not None else m_i
 
         # Recompute with updated m
         m_now = m[i]

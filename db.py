@@ -64,23 +64,35 @@ def init_db():
     CREATE TABLE IF NOT EXISTS trades (
         id            INTEGER PRIMARY KEY AUTOINCREMENT,
         symbol        TEXT NOT NULL,
-        side          TEXT NOT NULL,          -- buy / sell
+        side          TEXT NOT NULL,          -- always 'buy' for options (we buy calls/puts)
+        trade_type    TEXT DEFAULT 'stock',   -- 'option' or 'stock'
+        signal_dir    TEXT,                   -- BUY / SELL (the signal that triggered it)
         quantity      INTEGER DEFAULT 1,
 
         entry_ts      TEXT,
-        entry_price   REAL,
+        entry_price   REAL,                   -- per-share price (option: premium per share)
         entry_order   TEXT,                   -- RH order ID
         entry_sig_id  INTEGER REFERENCES signals(id),
 
         exit_ts       TEXT,
-        exit_price    REAL,
+        exit_price    REAL,                   -- per-share exit price
         exit_order    TEXT,
         exit_reason   TEXT,                   -- Claude reason or 'manual'
 
-        pnl           REAL,                   -- (exit - entry) * qty * direction
-        pnl_pct       REAL,
+        pnl           REAL,                   -- total $ P&L (options: multiplied by 100)
+        pnl_pct       REAL,                   -- % gain/loss on premium paid
         status        TEXT DEFAULT 'open'     -- open / closed
     )""")
+
+    # Safe migration: add columns that exist in new schema but not old DB
+    for col, definition in [
+        ("trade_type", "TEXT DEFAULT 'stock'"),
+        ("signal_dir", "TEXT"),
+    ]:
+        try:
+            cur.execute(f"ALTER TABLE trades ADD COLUMN {col} {definition}")
+        except sqlite3.OperationalError:
+            pass  # column already exists
 
     con.commit()
     con.close()
@@ -142,20 +154,42 @@ def log_decision(signal_id: int, call_type: str, decision: str, reason: str = ""
 # ── Trade entry / exit ─────────────────────────────────────────────────────────
 
 def open_trade(symbol: str, side: str, entry_price: float,
-               order_id: str, signal_id: int) -> int:
-    """Record a newly opened trade. Returns trade id."""
+               order_id: str, signal_id: int,
+               trade_type: str = "stock", signal_dir: str = "") -> int:
+    """
+    Record a newly opened trade. Returns trade id.
+    For options: side should always be 'buy' (we buy calls/puts to open).
+    signal_dir records the original BUY/SELL signal direction separately.
+    """
     con = _conn()
     cur = con.cursor()
     cur.execute("""
         INSERT INTO trades
-            (symbol, side, entry_ts, entry_price, entry_order, entry_sig_id, status)
-        VALUES (?,?,?,?,?,?,'open')
-    """, (symbol, side, datetime.now(timezone.utc).isoformat(),
+            (symbol, side, trade_type, signal_dir,
+             entry_ts, entry_price, entry_order, entry_sig_id, status)
+        VALUES (?,?,?,?,?,?,?,?,'open')
+    """, (symbol, side, trade_type, signal_dir,
+          datetime.now(timezone.utc).isoformat(),
           entry_price, order_id, signal_id))
     trade_id = cur.lastrowid
     con.commit()
     con.close()
     return trade_id
+
+
+def mark_closing(trade_id: int, close_order_id: str = ""):
+    """
+    Mark a trade as 'closing' when the close order is placed but not yet filled.
+    The trade stays in this state until get_option_order_status confirms a fill,
+    at which point close_trade() is called to set status='closed' with actual price.
+    """
+    con = _conn()
+    con.execute(
+        "UPDATE trades SET status='closing', exit_order=? WHERE id=?",
+        (close_order_id, trade_id)
+    )
+    con.commit()
+    con.close()
 
 
 def close_trade(trade_id: int, exit_price: float,
@@ -168,9 +202,17 @@ def close_trade(trade_id: int, exit_price: float,
         con.close()
         return
 
-    direction = 1 if row["side"] == "buy" else -1
-    pnl     = (exit_price - row["entry_price"]) * row["quantity"] * direction
-    pnl_pct = pnl / (row["entry_price"] * row["quantity"]) * 100 if row["entry_price"] else 0
+    # Options: we always buy (long premium). Multiplier = 100 (1 contract = 100 shares).
+    # Stocks: direction depends on side (buy=long, sell=short).
+    if row["trade_type"] == "option":
+        multiplier = 100
+        pnl = (exit_price - row["entry_price"]) * row["quantity"] * multiplier
+        pnl_pct = (exit_price / row["entry_price"] - 1) * 100 if row["entry_price"] else 0
+    else:
+        direction = 1 if row["side"] == "buy" else -1
+        multiplier = 1
+        pnl = (exit_price - row["entry_price"]) * row["quantity"] * direction
+        pnl_pct = pnl / (row["entry_price"] * row["quantity"]) * 100 if row["entry_price"] else 0
 
     cur.execute("""
         UPDATE trades SET

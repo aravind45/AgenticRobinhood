@@ -4,6 +4,7 @@
 import anthropic
 import json
 import os
+import re
 from trade_signal import SPY_SIGNAL
 
 DECISION_PROMPT = """
@@ -12,6 +13,8 @@ You receive both the Pine Script channel signal AND live market features pulled 
 
 This system trades large-cap US equities (AMD, NVDA, META, TSLA, GOOGL) using OPTIONS —
 buying ATM calls on BUY signals and ATM puts on SELL signals, ~14 DTE, 1 contract.
+Signals are generated from 5-MINUTE bars (intraday). All indicator periods apply to 5-min context:
+EMA(10) = 50 min, EMA(20) = 100 min, SMA(200) = ~2.5 days of intraday trend.
 
 The underlying strategy is EXHAUSTION / MEAN REVERSION:
 
@@ -102,16 +105,26 @@ def validate_signal(signal: dict, live_features: dict | None = None) -> tuple[st
         ]
     )
     
-    result = response.content[0].text.strip().replace("*", "").replace("#", "").strip()
+    raw = response.content[0].text
+    # Strip non-ASCII (emoji, Unicode checkmarks) — Windows cp1252 can't print them
+    result = re.sub(r'[^\x00-\x7F]+', '', raw).replace("*", "").replace("#", "").strip()
 
-    if "APPROVE" in result:
-        return "APPROVE", ""
-    elif result.startswith("REJECT"):
+    # Strict: parse FIRST token so "I APPROVE because..." can't slip through
+    first = result.split()[0].upper() if result.split() else ""
+    if first == "APPROVE":
+        return "APPROVE", result[7:].strip(" :-") or ""
+    elif first == "REJECT":
         return "REJECT", result[6:].strip(" :-")
-    elif result.startswith("HOLD"):
+    elif first == "HOLD":
         return "HOLD", result[4:].strip(" :-")
     else:
-        return "REJECT", f"Unexpected AI response: {result}"
+        # Fallback: substring search for malformed responses ("I would APPROVE...")
+        for kw in ("APPROVE", "REJECT", "HOLD"):
+            if kw in result:
+                idx = result.index(kw)
+                tail = result[idx + len(kw):].strip(" :-")
+                return kw, tail
+        return "REJECT", f"Unparseable response (first={first!r}): {result[:80]}"
 
 EXIT_PROMPT = """
 You are the Exit Engine for Project Alpha, an autonomous SPY trading system using an EXHAUSTION / MEAN REVERSION strategy.
@@ -168,11 +181,20 @@ def evaluate_exit(position: dict, current_signal: dict, live_features: dict | No
         ]
     )
 
-    result = response.content[0].text.strip().replace("*", "").replace("#", "").strip()
-    if "CLOSE" in result:
-        return "CLOSE", result[result.index("CLOSE") + 5:].strip(" :-")
+    raw = response.content[0].text
+    result = re.sub(r'[^\x00-\x7F]+', '', raw).replace("*", "").replace("#", "").strip()
+    # Strict first-token parse for exit decisions too
+    first = result.split()[0].upper() if result.split() else ""
+    if first == "CLOSE":
+        return "CLOSE", result[5:].strip(" :-")
+    elif first == "HOLD":
+        return "HOLD", result[4:].strip(" :-")
     else:
-        return "HOLD", result[result.index("HOLD") + 4:].strip(" :-") if "HOLD" in result else result
+        for kw in ("CLOSE", "HOLD"):
+            if kw in result:
+                idx = result.index(kw)
+                return kw, result[idx + len(kw):].strip(" :-")
+        return "HOLD", f"Unparseable exit response (first={first!r}): {result[:80]}"
 
 
 if __name__ == "__main__":
